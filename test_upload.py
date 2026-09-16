@@ -527,12 +527,48 @@ def test_hello(stub):
     check(len(stub.hellos) == 1, "and the ping was tried")
 
 
+def test_first_ping(stub):
+    """A token made at install is refused until the player registers it. The runner
+    re-pings every PING_S until the site takes one, runs a cycle then, and stops."""
+    ping_s, window_s = U.PING_S, U.PING_WINDOW_S
+    U.PING_S = 0.05
+    try:
+        root, up, log = fresh(stub)
+        cycles, cycle = [], up.cycle
+        up.cycle = lambda: (cycles.append(1), cycle())
+        stub.hello_code = 401                                   # not registered yet
+        r = U.Runner(up)
+        r.thread.start()
+        check(until(lambda: len(stub.hellos) >= 4), "an unregistered token is re-pinged every PING_S")
+        check(len(cycles) == 1 and not up.greeted, f"with no full cycle between pings {len(cycles)}")
+        stub.hello_code = 200                                   # the player clicks Register
+        check(until(lambda: len(cycles) == 2), "the first accepted ping runs a cycle at once")
+        check(up.greeted and [l for l in log if "accepted this machine's token" in l],
+              "and the log says the site took the token")
+        n = len(stub.hellos)
+        time.sleep(0.3)
+        check(len(stub.hellos) == n, f"then pings wait for the next cycle {len(stub.hellos) - n}")
+        r.stop(timeout=10)
+
+        U.PING_WINDOW_S = 0                                     # started too long ago
+        root, up, log = fresh(stub)
+        stub.hello_code = 401
+        stub.hellos.clear()
+        r = U.Runner(up)
+        r.thread.start()
+        time.sleep(0.3)
+        check(len(stub.hellos) == 1, f"past PING_WINDOW_S it pings once a cycle {len(stub.hellos)}")
+        r.stop(timeout=10)
+    finally:
+        U.PING_S, U.PING_WINDOW_S = ping_s, window_s
+
+
 def main():
     test_new_token()
     test_chunk_sizes()
     stub = Stub()
     for t in (test_voyage, test_battle_data, test_backfill, test_queue, test_nowhere, test_retry_and_reject,
-              test_never_raises, test_runner_and_config, test_hello):
+              test_never_raises, test_runner_and_config, test_hello, test_first_ping):
         stub.codes = []
         stub.hellos, stub.hello_code, stub.current_version = [], 200, U.VERSION
         t(stub)

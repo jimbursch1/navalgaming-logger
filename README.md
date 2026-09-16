@@ -46,7 +46,8 @@ You need Windows, a Naval Gaming account at lom.navalgaming.com, and Python 3.
    again.
 4. **Connect it to your account.** The first time, the installer copies a 64-character code
    to your clipboard and opens the site. Sign in, go to the **Logger** card on your dossier,
-   paste the code and click **Register**.
+   paste the code and click **Register**. Reload the page after 15 seconds or so, and the card
+   shows your logger running.
 
 The code is the fingerprint of a secret that stays on your machine, in
 `%APPDATA%\navalgaming-logger\upload.json`. Only the fingerprint is ever sent to the site.
@@ -75,15 +76,17 @@ Your records and your account connection are kept.
 
 ## Uninstall
 
-1. In PowerShell, run `Unregister-ScheduledTask 'NavalGaming Logger'`.
-2. Delete the logger's folder and `%APPDATA%\navalgaming-logger`.
-3. On your dossier's Logger card, click **Revoke** for the machine.
+1. **Double-click `uninstall.cmd`.** It stops the logger, removes the scheduled task and deletes
+   this machine's upload code from `%APPDATA%\navalgaming-logger`. Then it opens the site.
+2. On your dossier's Logger card, click **Revoke** for the machine.
+3. Delete the logger's folder if you don't want your records. The uninstaller leaves it alone.
 
 ## Files
 
 | File | What it is |
 |---|---|
 | `install.cmd`, `install.ps1` | The installer. |
+| `uninstall.cmd`, `uninstall.ps1` | The uninstaller. |
 | `start.ps1` | Restarts the logger. |
 | `navalgaming_logger.py` | The logger. |
 | `dumpbattle.py` | Reads a battle's ship records; the logger uses it. |

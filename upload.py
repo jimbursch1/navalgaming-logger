@@ -19,7 +19,9 @@ the game's memory.
 Every cycle also opens with a health ping -- the logger's version and what it is
 doing -- so the site can show on your dossier whether the logger is running, and
 tell you when a new release is out (docs/plans/logger-health.md). It writes no
-records, and a failed ping never holds up a voyage.
+records, and a failed ping never holds up a voyage. Until the site first takes one --
+a token not yet registered -- it is re-sent every 15 s for up to 30 minutes, so a
+new install shows on the dossier moments after Register.
 
 Every write on the site is idempotent, so a voyage cut short by a network failure
 is simply sent again, whole, next cycle.
@@ -63,8 +65,10 @@ import urllib.request
 # This logger's release. Sent in every health ping so the site can tell a member
 # their logger is behind; keep it equal to LOGGER_VERSION in inc/logger_version.php.
 # The date form compares correctly as a plain string, so nothing parses versions.
-VERSION = "2026-09-16"
+VERSION = "2026-09-16b"
 CYCLE_S = 300               # between cycles, when no arrival wakes one sooner
+PING_S = 15                 # until the site first takes a ping, re-ping this often...
+PING_WINDOW_S = 1800        # ...for at most this long after starting
 # Lines per request. The site takes 256 KB a body: a full track point is ~130
 # bytes, a broadside ~110, a wind sample ~50, a motion line ~40 (test_upload.py
 # checks the worst case).
@@ -230,6 +234,7 @@ class Uploader:
         # through Runner.set_state. "waiting" until it has attached to anything.
         self.state_name = "waiting"
         self.told = None                # the newest release already named in the log
+        self.greeted = False            # whether the site has taken a ping this run
 
     def load_state(self):
         try:
@@ -251,6 +256,9 @@ class Uploader:
         the top of every cycle, so a member can see on their dossier whether it runs
         (docs/plans/logger-health.md). The reply names the current release."""
         reply = self.post({"kind": "hello", "version": VERSION, "state": self.state_name})
+        if not self.greeted:
+            self.greeted = True
+            self.log("upload: the site accepted this machine's token")
         current = (reply or {}).get("current_version")
         # Once per release, not once per cycle: this runs every 5 minutes.
         if isinstance(current, str) and current > VERSION and current != self.told:
@@ -414,13 +422,33 @@ class Runner:
     def __init__(self, uploader):
         self.up, self.wake, self.stopping = uploader, threading.Event(), False
         self.thread = threading.Thread(target=self.run, name="upload", daemon=True)
+        self.started = time.monotonic()
 
     def run(self):
         while not self.stopping:
             self.up.cycle()
-            if self.wake.wait(CYCLE_S):
+            if self.pause():
                 self.wake.clear()               # or every wait after the first nudge returns at once
         self.up.cycle()                         # a voyage that closed just before exit
+
+    def pause(self):
+        """Wait out CYCLE_S between cycles; True if woken early.
+
+        A new install makes its token before the player has registered it, so its first
+        pings are refused. Until the site takes one, and for at most PING_WINDOW_S after
+        starting, re-ping every PING_S instead, and run a cycle as soon as one is taken:
+        the dossier then shows the logger seconds after Register, not minutes. The site
+        writes nothing for an unknown token, so these pings cost it one indexed read."""
+        end = time.monotonic() + CYCLE_S
+        while not self.up.greeted and time.monotonic() - self.started < PING_WINDOW_S:
+            if self.wake.wait(PING_S):
+                return True
+            try:
+                self.up.hello()
+                return True
+            except Exception:
+                pass
+        return self.wake.wait(max(0.0, end - time.monotonic()))
 
     def set_state(self, name):
         """What the next health ping reports: attached, loading or waiting."""
