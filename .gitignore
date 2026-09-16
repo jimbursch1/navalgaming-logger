@@ -1,0 +1,7 @@
+# What the logger writes beside itself
+battles/
+track/
+upload-state.json
+upload.json
+navalgaming-logger.log
+__pycache__/
