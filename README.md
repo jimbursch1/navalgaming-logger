@@ -38,16 +38,23 @@ You need Windows, a Naval Gaming account at lom.navalgaming.com, and Python 3.
 
 1. **Install Python 3** from [python.org](https://www.python.org/downloads/windows/). On the
    installer's first screen, tick **"Add python.exe to PATH"**.
-2. **Download the logger:** take the zip from the
-   [latest release](https://github.com/jimbursch1/navalgaming-logger/releases/latest), and
-   extract it to any folder you like. The logger keeps its records in that folder.
+2. **Download the logger:**
+   [navalgaming-logger-main.zip](https://github.com/jimbursch1/navalgaming-logger/archive/refs/heads/main.zip),
+   the current release (the Logger card on your dossier links the same file). Extract it to any
+   folder you like, and leave it there: the logger runs from it and keeps its records in it.
 3. **Double-click `install.cmd`.** It checks Python, registers a scheduled task called
    "NavalGaming Logger" that starts the logger at logon, and starts it now. It is safe to run
    again.
-4. **Connect it to your account.** The first time, the installer copies a 64-character code
-   to your clipboard and opens the site. Sign in, go to the **Logger** card on your dossier,
-   paste the code and click **Register**. Reload the page after 15 seconds or so, and the card
-   shows your logger running.
+4. **Connect it to your account.** The first time, the installer opens your dossier with a
+   64-character code already filled in on the **Logger** card: click **Register**. (If you
+   weren't signed in, sign in and paste the code; the installer also copied it to your
+   clipboard.) Reload the page after 15 seconds or so, and the card shows your logger running.
+   One machine per account: to move the logger to another computer, revoke the old one on the
+   card first.
+
+Only register a code that came from running the installer on your own computer. Anyone can
+send a link with their own code in it, and registering that files their uploads under your
+name.
 
 The code is the fingerprint of a secret that stays on your machine, in
 `%APPDATA%\navalgaming-logger\upload.json`. Only the fingerprint is ever sent to the site.

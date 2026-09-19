@@ -10,7 +10,7 @@
 #    session, not elevated, under pythonw (no window), restarted up to 3 times a
 #    minute apart if it dies, no time limit. Re-running replaces it.
 # 3. Makes an upload token, unless this machine already has one, copies its SHA-256
-#    to the clipboard and opens the site, where the Logger card on your dossier takes it.
+#    to the clipboard and opens the site with it filled in on your dossier's Logger card.
 # 4. Starts the logger now, rather than at the next logon.
 #
 # To remove it: Unregister-ScheduledTask 'NavalGaming Logger'
@@ -55,9 +55,19 @@ if (Test-Path $config) {
 } else {
     & $py "$dir\upload.py" --new-token "$site/logger_upload.php"
     if ($LASTEXITCODE -ne 0) { exit 1 }
+    # The page fills the code in from the fragment, which never reaches the server.
+    # The hash is upload.py's: SHA-256 of the token's UTF-8 bytes, lowercase hex.
+    $page = "$site/#logger"
+    try {
+        $token = (Get-Content -Raw $config | ConvertFrom-Json).token
+        $bytes = [Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($token))
+        $hash = -join ($bytes | ForEach-Object { $_.ToString('x2') })
+        if ($hash -match '^[0-9a-f]{64}$') { $page = "$site/#logger=$hash" }
+    } catch { }
     Write-Host ''
-    Write-Host "Opening $site/ -- sign in, and on your dossier's Logger card paste and click Register."
-    Start-Process "$site/#logger"
+    Write-Host "Opening $site/ -- on your dossier's Logger card, click Register."
+    Write-Host '(Not signed in? Sign in, then paste the code into the card.)'
+    Start-Process $page
 }
 
 # 4. Start it now.
