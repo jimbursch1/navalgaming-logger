@@ -16,7 +16,7 @@ import navalgaming_logger as B
 import dumpbattle as D
 import test_dumpbattle as T
 
-VPTR = 0x391810000 + B.VPTR_RVA
+VPTR = 0x391810000 + B.VTABLE_RVA_FALLBACK + B.VPTR_SKIP
 ROOT_OFF, BS_OFF = 0x20000, 0x30000
 LOCAL = 8906
 FAILS = []
@@ -124,8 +124,95 @@ def reading(buf):
     return B.read_battle(FakeProcess(buf), [T.BASE_VA + ROOT_OFF], VPTR)
 
 
+def fake_dll(symbols, sig=b"PE\0\0", pe_off=0x80, nsec=2, size_of_image=0x2000000,
+             sec_vaddr=(0x1000, 0x1000000), strip=False):
+    """A minimal PE with a COFF symbol table, for vtable_rva().
+
+    `symbols` is a list of (name, section_number, value, naux). A name over 8 bytes goes in
+    the string table and its record holds the offset, which is the only case that matters
+    here -- _ZTV10scene_root is 16 characters. Auxiliary records are emitted as filler after
+    their symbol, because skipping them wrongly is the classic way to misread this table.
+    """
+    strtab = bytearray(b"\0\0\0\0")              # the size field, filled in at the end
+    recs = bytearray()
+    for name, secno, value, naux in symbols:
+        nb = name.encode()
+        rec = bytearray(18)
+        if len(nb) > 8:
+            off = len(strtab)
+            strtab += nb + b"\0"
+            struct.pack_into("<II", rec, 0, 0, off)
+        else:
+            rec[0:len(nb)] = nb
+        struct.pack_into("<IhHBB", rec, 8, value, secno, 0, 2, naux)
+        recs += rec
+        recs += bytes(18 * naux)                 # the auxiliary records themselves
+    struct.pack_into("<I", strtab, 0, len(strtab))
+
+    optsz = 0x70
+    sect_at = pe_off + 4 + 20 + optsz
+    symtab_at = sect_at + nsec * 40
+    nsyms = 0 if strip else len(recs) // 18
+    buf = bytearray(symtab_at)
+    struct.pack_into("<I", buf, 0x3C, pe_off)
+    buf[pe_off:pe_off + 4] = sig
+    # COFF: Machine, NumberOfSections, TimeDateStamp, PointerToSymbolTable,
+    # NumberOfSymbols, SizeOfOptionalHeader.
+    struct.pack_into("<HHIIIH", buf, pe_off + 4, 0x8664, nsec, 1789062088,
+                     0 if strip else symtab_at, nsyms, optsz)
+    struct.pack_into("<H", buf, pe_off + 4 + 20, 0x20B)          # PE32+
+    struct.pack_into("<I", buf, pe_off + 4 + 20 + 56, size_of_image)
+    for i in range(nsec):
+        struct.pack_into("<I", buf, sect_at + i * 40 + 12, sec_vaddr[i])
+    return bytes(buf + recs + strtab)
+
+
+def test_vtable_rva():
+    """The scene_root anchor, read out of the DLL instead of pinned. Never raises: a
+    failure means the caller uses VTABLE_RVA_FALLBACK, which is the old behaviour."""
+    d = tempfile.mkdtemp()
+
+    def write(name, blob):
+        p = os.path.join(d, name)
+        with open(p, "wb") as f:
+            f.write(blob)
+        return p
+
+    # Section 2 is at 0x1000000, so value 0x32D200 lands on the real 2026-09-10 RVA.
+    good = [("__imp_foo", 1, 0x10, 0), (B.SCENE_ROOT_SYMBOL, 2, 0x32D200, 0)]
+    check(B.vtable_rva(write("a.dll", fake_dll(good))) == 0x132D200,
+          "vtable_rva: section VirtualAddress + symbol value")
+
+    # An auxiliary record before the symbol: a plain 18-byte stride would read it as a
+    # record and miss what follows.
+    aux = [("withauxx_long_name", 1, 0x10, 2), (B.SCENE_ROOT_SYMBOL, 2, 0x32D200, 0)]
+    check(B.vtable_rva(write("b.dll", fake_dll(aux))) == 0x132D200,
+          "vtable_rva: auxiliary records are skipped, not read as symbols")
+
+    # A longer name ending in ours must not be mistaken for it.
+    decoy = [("_Z_prefix" + B.SCENE_ROOT_SYMBOL, 1, 0x10, 0)]
+    check(B.vtable_rva(write("c.dll", fake_dll(decoy))) is None,
+          "vtable_rva: a name merely ending with the symbol is not a match")
+    check(B.vtable_rva(write("d.dll", fake_dll(decoy + good))) == 0x132D200,
+          "vtable_rva: ...and the real one is still found alongside it")
+
+    # An RVA outside SizeOfImage is not believable; better the fallback than a bad scan.
+    check(B.vtable_rva(write("e.dll", fake_dll(good, size_of_image=0x1000))) is None,
+          "vtable_rva: an RVA past SizeOfImage is refused")
+
+    for name, blob in (("stripped", fake_dll(good, strip=True)),
+                       ("not a PE", fake_dll(good, sig=b"XX\0\0")),
+                       ("symbol absent", fake_dll([("__imp_foo", 1, 0x10, 0)])),
+                       ("truncated", fake_dll(good)[:0x40]),
+                       ("empty", b"")):
+        check(B.vtable_rva(write("f.dll", blob)) is None, f"vtable_rva: None for {name}")
+    check(B.vtable_rva(os.path.join(d, "absent.dll")) is None, "vtable_rva: None for no file")
+    check(B.vtable_rva(d) is None, "vtable_rva: None for a directory")
+
+
 def main():
     buf = build()
+    test_vtable_rva()
 
     roots, scanned = B.find_roots(FakeProcess(buf), VPTR)
     check(roots == [T.BASE_VA + ROOT_OFF], f"find_roots -> exactly the aligned instance {roots}")
@@ -346,9 +433,13 @@ def test_voyages(fix):
 
 def test_supervisor(fix):
     """The logger runs from logon, so it waits for the client and outlives it."""
-    log, naps, closed, states = [], [], [], []
+    log, naps, closed, states, games = [], [], [], [], []
     base = 0x7FF000000000
-    procs = iter([(None, None), (None, None), (4242, None), (4242, base), (4242, base)])
+    DLL = r"C:\Games\steamapps\common\LettersOfMarquePlaytest\libgdexample.dll"
+    # find_process returns (pid, base, the DLL's path); the path is only known once the
+    # module is loaded, so the early looks have none.
+    procs = iter([(None, None, None), (None, None, None), (4242, None, None),
+                  (4242, base, DLL), (4242, base, DLL)])
     scans = iter([[], [0x1000]])
 
     class Reader:
@@ -363,10 +454,11 @@ def test_supervisor(fix):
     B.ProcessReader = Reader
     B.find_roots = lambda rd, vptr: (next(scans), 1 << 30)
     try:
-        rd, roots, vptr = B.attach(log.append, naps.append, states.append)
+        rd, roots, vptr = B.attach(log.append, naps.append, states.append, games.append)
     finally:
         B.find_process, B.ProcessReader, B.find_roots = saved
-    check(roots == [0x1000] and vptr == base + B.VPTR_RVA and rd.pid == 4242,
+    check(roots == [0x1000] and vptr == base + B.VTABLE_RVA_FALLBACK + B.VPTR_SKIP
+          and rd.pid == 4242,
           "attach: returns once the client is up and scene_root is found")
     check(naps == [B.WAIT_S] * 3 + [B.SCAN_S],
           f"attach: looks for the client every {B.WAIT_S:.0f} s (its DLL not loaded yet counts "
@@ -379,6 +471,11 @@ def test_supervisor(fix):
     # menu from offsets gone stale after a game update.
     check(states == ["waiting"] * 3 + ["loading"],
           f"attach: reports waiting until the client is up, then loading until the world is {states}")
+    # The game build (docs/plans/game-build-detection.md). The path is reported as soon as
+    # the module is there -- before the scan -- because a client that never loads a world
+    # is exactly when knowing its build matters: that is what stale offsets look like.
+    check(games == [DLL, DLL],
+          f"attach: the gameplay DLL's path is reported once the module is loaded {games}")
 
     port0, port5 = {"state": "port", "port": 0}, {"state": "port", "port": 5}
     ticks = iter([(B.NONE, port0), (B.OK, fix), (B.NONE, port5), (B.GONE, None)])

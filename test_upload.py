@@ -6,6 +6,7 @@ import calendar
 import http.server
 import json
 import os
+import struct
 import sys
 import tempfile
 import threading
@@ -37,6 +38,7 @@ class Stub(http.server.ThreadingHTTPServer):
         self.requests, self.codes, self.hellos = [], [], []
         self.hello_code = 200
         self.current_version = U.VERSION       # what the site calls the newest release
+        self.current_build = None              # the build the site's offsets came from
         threading.Thread(target=self.serve_forever, daemon=True).start()
 
     @property
@@ -54,8 +56,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         headers = {k.lower(): v for k, v in self.headers.items()}
         if body.get("kind") == "hello":
             self.server.hellos.append({"headers": headers, "body": body})
-            return self.reply(self.server.hello_code,
-                              {"ok": True, "current_version": self.server.current_version})
+            answer = {"ok": True, "current_version": self.server.current_version}
+            # The real endpoint always sends current_build; None here lets a test check
+            # that a logger talking to a site older than the field is unbothered.
+            if self.server.current_build is not None:
+                answer["current_build"] = self.server.current_build
+            return self.reply(self.server.hello_code, answer)
         self.server.requests.append({"headers": headers, "body": body})
         code = self.server.codes.pop(0) if self.server.codes else 200
         reply = {"ok": True, "battle_id": len(self.server.requests)} if code == 200 else \
@@ -268,7 +274,7 @@ def test_never_raises(stub):
     with open(up.state_path, "w") as f:
         f.write("[not a state")
     up2 = U.Uploader(root, dict(up.config, url=stub.url), log.append, now=lambda: NOW)
-    check(up2.state == {"voyages": {}}, "a corrupt state file starts fresh")
+    check(up2.state == {"voyages": {}, "game_dll": None}, "a corrupt state file starts fresh")
     with open(os.path.join(root, "battles", "junk.json"), "w") as f:
         f.write("{not json")
     with open(os.path.join(root, "track", U.voyage_name(iso(NOW - 3600))), "ab") as f:
@@ -527,6 +533,117 @@ def test_hello(stub):
     check(len(stub.hellos) == 1, "and the ping was tried")
 
 
+def fake_pe(stamp, sig=b"PE\0\0", pe_off=0x80):
+    """The smallest file dll_build() should accept: e_lfanew at 0x3C pointing at a PE
+    signature, with TimeDateStamp 8 bytes past it (Machine and NumberOfSections first)."""
+    buf = bytearray(pe_off + 24)
+    struct.pack_into("<I", buf, 0x3C, pe_off)
+    buf[pe_off:pe_off + 4] = sig
+    struct.pack_into("<HH", buf, pe_off + 4, 0x8664, 20)     # Machine, sections
+    struct.pack_into("<I", buf, pe_off + 8, stamp)
+    return bytes(buf)
+
+
+def test_dll_build():
+    """Which game build a machine has: the gameplay DLL's PE link time
+    (docs/plans/game-build-detection.md). Never raises -- being wrong here must not
+    cost a battle, so everything unexpected is None."""
+    d = tempfile.mkdtemp()
+    real = 1789062088                          # the 2026-09-10 client build's link time
+    p = os.path.join(d, "gdx.dll")
+    with open(p, "wb") as f:
+        f.write(fake_pe(real))
+    check(U.dll_build(p) == real, f"the TimeDateStamp is read off a PE {U.dll_build(p)}")
+
+    # A high pe_offset proves it seeks rather than assuming a fixed layout.
+    p2 = os.path.join(d, "far.dll")
+    with open(p2, "wb") as f:
+        f.write(fake_pe(real, pe_off=0x400))
+    check(U.dll_build(p2) == real, "the PE header is found wherever e_lfanew points")
+
+    for name, blob in (
+            ("not a PE", fake_pe(real, sig=b"XX\0\0")),
+            ("a zeroed stamp (reproducible build)", fake_pe(0)),
+            ("a stamp before the game existed", fake_pe(1000000)),
+            ("a stamp absurdly far ahead", fake_pe(4200000000)),
+            ("a file too short for a header", b"MZ" + b"\0" * 20),
+            ("an empty file", b""),
+    ):
+        q = os.path.join(d, "bad.dll")
+        with open(q, "wb") as f:
+            f.write(blob)
+        check(U.dll_build(q) is None, f"None for {name}")
+    check(U.dll_build(os.path.join(d, "absent.dll")) is None, "None for a missing file")
+    check(U.dll_build(d) is None, "None for a directory")
+
+
+def test_hello_build(stub):
+    """The build travels in the ping, and the site's answer reaches the log once."""
+    root, up, log = fresh(stub)
+    real = 1789062088
+    dll = os.path.join(root, "gdx.dll")
+    with open(dll, "wb") as f:
+        f.write(fake_pe(real))
+
+    # Before the game has ever been seen, the field is absent -- not null. The site
+    # reads absent as "not saying" and must not take it for a mismatch.
+    stub.hellos.clear()
+    up.cycle()
+    check("build" not in stub.hellos[-1]["body"],
+          f"no build is sent before the game has been seen {stub.hellos[-1]['body']}")
+
+    up.set_game(dll)
+    stub.hellos.clear()
+    up.cycle()
+    check(stub.hellos[-1]["body"].get("build") == real,
+          f"once the DLL is known, the build rides along {stub.hellos[-1]['body']}")
+
+    # It must survive a restart: Steam patches while the game is shut, and the path is
+    # only learnable from a running process.
+    up2 = U.Uploader(root, dict(up.config, url=stub.url), log.append, now=lambda: NOW)
+    check(up2.game_dll == dll, "the DLL path is remembered across a restart")
+    stub.hellos.clear()
+    up2.cycle()
+    check(stub.hellos[-1]["body"].get("build") == real, "and is still reported")
+
+    # The site's offsets are older than this machine's game: say so once per build.
+    root, up, log = fresh(stub)
+    up.set_game(dll)
+    stub.current_build = real - 86400
+    up.cycle()
+    up.cycle()
+    told = [l for l in log if "the game has updated" in l]
+    check(len(told) == 1 and str(real) in told[0],
+          f"an updated game is named once per build, not once per cycle {told}")
+
+    # A logger on exactly the build the offsets came from hears nothing...
+    root, up, log = fresh(stub)
+    up.set_game(dll)
+    stub.current_build = real
+    up.cycle()
+    check(not [l for l in log if "the game has updated" in l],
+          "a matching build says nothing")
+
+    # ...and neither does one whose game is BEHIND the release: that is the member's
+    # Steam to update, and their dossier says so. Nothing for the log to add.
+    root, up, log = fresh(stub)
+    up.set_game(dll)
+    stub.current_build = real + 86400
+    up.cycle()
+    check(not [l for l in log if "the game has updated" in l],
+          "a build behind the release says nothing here")
+
+    # A site too old to answer with current_build must not break anything: the build
+    # still goes out, and nothing is logged about it.
+    root, up, log = fresh(stub)
+    up.set_game(dll)
+    stub.current_build = None
+    up.cycle()
+    check(stub.hellos[-1]["body"].get("build") == real
+          and not [l for l in log if "the game has updated" in l],
+          "a site that does not answer with a build is harmless")
+
+
 def test_first_ping(stub):
     """A token made at install is refused until the player registers it. The runner
     re-pings every PING_S until the site takes one, runs a cycle then, and stops."""
@@ -566,11 +683,13 @@ def test_first_ping(stub):
 def main():
     test_new_token()
     test_chunk_sizes()
+    test_dll_build()
     stub = Stub()
     for t in (test_voyage, test_battle_data, test_backfill, test_queue, test_nowhere, test_retry_and_reject,
-              test_never_raises, test_runner_and_config, test_hello, test_first_ping):
+              test_never_raises, test_runner_and_config, test_hello, test_hello_build, test_first_ping):
         stub.codes = []
         stub.hellos, stub.hello_code, stub.current_version = [], 200, U.VERSION
+        stub.current_build = None
         t(stub)
     stub.shutdown()
     print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")

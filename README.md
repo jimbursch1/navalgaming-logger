@@ -63,9 +63,15 @@ Don't share `upload.json`: whoever has it can upload to your account.
 
 ## Updates
 
-**When the game updates, the logger stops finding the game until a new release of the logger
-comes out.** The memory layout it reads changes with each game build. You'll see this on
-the Logger card, and in the log.
+**Since 2026-09-19b, most game updates no longer stop the logger.** The main thing it has to
+locate inside the game used to move with every build; it now works that out from the game's own
+files each time it starts, rather than having it written in.
+
+Some updates will still need a new release, because the game's internal layout can change in ways
+the logger cannot work out for itself. When that happens it keeps running but stops finding the
+game — and **you do not have to work out why**. It says so in the log, your dossier's Logger card
+says so too, and it reports which game build you are on so a new release can be prepared. There is
+nothing to fix at your end, and nothing you have already recorded is lost.
 
 Your dossier's Logger card also tells you when a newer release is out. **To update:**
 1. Download the new release's zip.

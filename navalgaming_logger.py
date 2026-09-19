@@ -72,9 +72,15 @@ BATTLE_TICK_S = 1.0         # while a battle is loaded: a replay needs finer ste
 TORN_LIMIT = 9              # consecutive bad reads before a battle counts as over (~9 s)
 CHUNK = 1 << 26
 
-# 2026-09-10 DLL. The vtable is from the COFF symbol table, the offsets from DWARF.
-VTABLE_RVA = 0x132D200      # _ZTV10scene_root
-VPTR_RVA = VTABLE_RVA + 16  # an instance's vptr skips offset-to-top and typeinfo
+# The struct offsets below are from DWARF and are per build (2026-09-10 DLL, game build
+# 1789062088). The vtable RVA is NOT: vtable_rva() reads it out of the DLL in front of us,
+# because it moves with every client build and was the single commonest reason this logger
+# stopped working after a game update. This is the fallback for a DLL whose COFF symbol
+# table is missing or stripped -- correct for the 2026-09-10 build, and stale the moment
+# the game patches, which is exactly why it is no longer the primary source.
+SCENE_ROOT_SYMBOL = "_ZTV10scene_root"
+VTABLE_RVA_FALLBACK = 0x132D200
+VPTR_SKIP = 16              # an instance's vptr skips offset-to-top and typeinfo
 SR_BS = 3056                # scene_root.bs : battle_scene*
 BS_MY_SHIP = 40             # battle_scene.my_ship_id : uint64_t
 BS_OPAQUE = 256             # battle_scene.o : opaque*
@@ -163,8 +169,100 @@ class ProcessReader:
             va = mbi.BaseAddress + mbi.RegionSize
 
 
+def vtable_rva(path, symbol=SCENE_ROOT_SYMBOL):
+    """The RVA of `symbol` from the DLL's COFF symbol table, or None.
+
+    This is tools/gamefiles/symrva.py's logic, made seek-based so it can run on a member's
+    machine: symrva reads the whole 259 MB file, this reads the PE header, the section
+    table, the 3.5 MB of symbol records and the 9.7 MB string table -- about 13 MB, and
+    once per game session. The GDExtension DLL ships its COFF symbol table unstripped
+    (GAMEFILES.md 7.11), so the anchor is readable off disk with no debug tooling.
+
+    Why bother: this RVA moves with essentially every client build (0x132D180 on the
+    2026-09-08 build, 0x132D200 on 2026-09-10), and a stale one is the dominant reason the
+    logger stops finding the world after a game update. Reading it from the DLL in front of
+    us means most updates stop breaking anything.
+
+    Returns None rather than raising, on any malformed or unexpected file: the caller falls
+    back to the pinned constant, which is the old behaviour.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0x3C)
+            b = f.read(4)
+            if len(b) != 4:
+                return None
+            pe = struct.unpack("<I", b)[0]
+            f.seek(pe)
+            hdr = f.read(24)                     # signature (4) + the 20-byte COFF header
+            if len(hdr) != 24 or hdr[:4] != b"PE\0\0":
+                return None
+            # From coff+2: NumberOfSections, (TimeDateStamp), PointerToSymbolTable,
+            # NumberOfSymbols, SizeOfOptionalHeader.
+            nsec, symtab, nsyms, optsz = struct.unpack_from("<HxxxxIIH", hdr, 6)
+            if not symtab or not nsyms or not nsec:
+                return None                      # stripped: no symbol table to read
+
+            # SizeOfImage sits at optional-header +56 in both PE32 and PE32+, and bounds
+            # any RVA in the image -- the sanity check on whatever we resolve.
+            f.seek(pe + 4 + 20 + 56)
+            b = f.read(4)
+            size_of_image = struct.unpack("<I", b)[0] if len(b) == 4 else 0
+
+            f.seek(pe + 4 + 20 + optsz)          # the section table follows the headers
+            sect = f.read(nsec * 40)
+            if len(sect) != nsec * 40:
+                return None
+            vaddr = [struct.unpack_from("<I", sect, i * 40 + 12)[0] for i in range(nsec)]
+
+            f.seek(symtab)
+            syms = f.read(nsyms * 18)            # 18-byte records, ~3.5 MB here
+            if len(syms) != nsyms * 18:
+                return None
+            strtab = symtab + nsyms * 18         # the string table follows them
+            f.seek(strtab)
+            b = f.read(4)
+            if len(b) != 4:
+                return None
+            strsz = struct.unpack("<I", b)[0]    # includes these 4 bytes
+            strs = f.read(max(0, strsz - 4)) if strsz > 4 else b""
+
+            # A name of 16 characters cannot be inline in the 8-byte field, so it lives in
+            # the string table and the record holds an offset to it. Find the string first,
+            # then the record pointing at it -- one pass each, no per-symbol seeking.
+            want = symbol.encode("ascii") + b"\0"
+            at = strs.find(want)
+            while at > 0 and strs[at - 1] != 0:
+                at = strs.find(want, at + 1)     # a suffix of a longer name, keep looking
+            if at < 0:
+                return None
+            name_off = 4 + at                    # offsets are from the table's start
+
+            i = 0
+            while i < nsyms:
+                e = i * 18
+                if syms[e:e + 4] == b"\0\0\0\0" and \
+                        struct.unpack_from("<I", syms, e + 4)[0] == name_off:
+                    value, secno = struct.unpack_from("<Ih", syms, e + 8)
+                    if 0 < secno <= nsec:
+                        rva = vaddr[secno - 1] + value
+                        if 0 < rva and (not size_of_image or rva < size_of_image):
+                            return rva
+                    return None
+                # Auxiliary records follow their symbol; a plain stride of 18 reads them
+                # as symbols and finds nonsense.
+                i += 1 + syms[e + 17]
+            return None
+    except (OSError, struct.error, IndexError):
+        return None
+
+
 def find_process(exe=EXE, module=D.DLL_NAME):
-    """(pid, gameplay DLL base) via a Toolhelp snapshot, or (None, None)."""
+    """(pid, gameplay DLL base, its path) via a Toolhelp snapshot, or (None, None, None).
+
+    The path comes free with the snapshot -- szExePath is already in MODULEENTRY32 below --
+    and upload.py reads the DLL's link time off it to say which game build this machine
+    has (docs/plans/game-build-detection.md)."""
     import ctypes
     from ctypes import wintypes as W
     k = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -206,11 +304,12 @@ def find_process(exe=EXE, module=D.DLL_NAME):
                                                   k.Process32NextW)
                 if e.szExeFile.lower() == exe.lower()), None)
     if pid is None:
-        return None, None
-    base = next((e.modBaseAddr for e in entries(0x8 | 0x10, pid, ME, k.Module32FirstW,
-                                                 k.Module32NextW)
-                 if module.lower() in e.szModule.lower()), None)
-    return pid, base
+        return None, None, None
+    mod = next((e for e in entries(0x8 | 0x10, pid, ME, k.Module32FirstW, k.Module32NextW)
+                if module.lower() in e.szModule.lower()), None)
+    if mod is None:
+        return pid, None, None
+    return pid, mod.modBaseAddr, mod.szExePath
 
 
 # --- finding scene_root, and reading the battle under it ------------------------
@@ -818,17 +917,29 @@ class RotatingLog:
             self.f.flush()
 
 
-def attach(log=print, sleep=time.sleep, on_state=None):
+def attach(log=print, sleep=time.sleep, on_state=None, on_game=None):
     """Wait for the client and its scene_root, then (reader, roots, vptr). The
     root appears once the world has loaded, so a scan finding none -- the client
     starting up, or in its menus -- is tried again SCAN_S later.
 
+    The scene_root vtable RVA is read out of the DLL itself (vtable_rva), once per
+    session, so a build that only moves the vtable no longer breaks anything. The pinned
+    VTABLE_RVA_FALLBACK is used only when the symbol cannot be read.
+
     on_state, when given, is told "waiting" (no client) or "loading" (a client, no
-    scene_root) for the health ping. A client that stays "loading" for hours is how
-    a stale VTABLE_RVA looks from the site."""
+    scene_root) for the health ping. A client that stays "loading" for hours now means the
+    DWARF struct offsets no longer fit the build -- the anchor came from the build itself.
+
+    on_game, when given, is told where the gameplay DLL is as soon as the client is
+    found -- before the scan, because a client that never loads a world is exactly the
+    case where knowing its build matters most. The uploader remembers the path, so the
+    build keeps being reported after the game is closed."""
     said = None
+    resolved, rva = None, VTABLE_RVA_FALLBACK    # the DLL the RVA below was read from
     while True:
-        pid, base = find_process()
+        pid, base, dll = find_process()
+        if on_game and dll:
+            on_game(dll)
         if pid is None or base is None:
             if on_state:
                 on_state("waiting")
@@ -837,7 +948,19 @@ def attach(log=print, sleep=time.sleep, on_state=None):
                 said = "client"
             sleep(WAIT_S)
             continue
-        vptr = base + VPTR_RVA
+        # Resolve the anchor from this DLL, once per session. Only the fallback can be
+        # stale now, so say which one is in use -- it is the first thing to check if the
+        # scan below finds nothing.
+        if resolved != dll:
+            resolved, rva = dll, (vtable_rva(dll) if dll else None)
+            if rva is None:
+                rva = VTABLE_RVA_FALLBACK
+                log(f"{utcnow()} {SCENE_ROOT_SYMBOL} not readable from the DLL; falling "
+                    f"back to the pinned 0x{rva:x}, which is only right for game build "
+                    "1789062088")
+            else:
+                log(f"{utcnow()} {SCENE_ROOT_SYMBOL} @ RVA 0x{rva:x}, read from the DLL")
+        vptr = base + rva + VPTR_SKIP
         try:
             rd = ProcessReader(pid)
         except OSError:
@@ -846,6 +969,10 @@ def attach(log=print, sleep=time.sleep, on_state=None):
         t0 = time.time()
         roots, scanned = find_roots(rd, vptr)
         if roots:
+            build = upload.dll_build(dll) if dll else None
+            if build is not None:
+                log(f"{utcnow()} game build {build} "
+                    f"({time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(build))} UTC)")
             log(f"{utcnow()} pid {pid}  {D.DLL_NAME} @ 0x{base:x}  scanned "
                 f"{scanned / 2**30:.2f} GB in {time.time() - t0:.1f} s: {len(roots)} "
                 "scene_root candidate(s) " + " ".join(f"0x{r:x}" for r in roots))
@@ -854,10 +981,14 @@ def attach(log=print, sleep=time.sleep, on_state=None):
         if on_state:
             on_state("loading")
         if said != pid:
+            # The anchor is no longer the likely suspect -- it came from this build's own
+            # symbol table. What is still pinned is the DWARF struct offsets, so a client
+            # that never yields scene_root now points at a patched build the offsets do not
+            # fit (the site says so definitely, from the build in the health ping).
             log(f"{utcnow()} {EXE} running (pid {pid}) but no scene_root yet: waiting for "
-                "the world to load. If it never comes, VTABLE_RVA is stale -- the client "
-                "updated, and a new logger release is needed "
-                "(github.com/jimbursch1/navalgaming-logger)")
+                "the world to load. If it never comes, the game has most likely updated "
+                "and this release's struct offsets no longer fit it -- a new logger release "
+                "is needed (github.com/jimbursch1/navalgaming-logger)")
             said = pid
         sleep(SCAN_S)
 
@@ -893,7 +1024,8 @@ def main():
     try:
         while True:
             try:
-                rd, roots, vptr = attach(on_state=up.set_state if up else None)
+                rd, roots, vptr = attach(on_state=up.set_state if up else None,
+                                         on_game=up.set_game if up else None)
                 if up:
                     up.set_state("attached")
                 try:
@@ -915,13 +1047,33 @@ def main():
 
 def once():
     """--once: the current battle and position, printed, for checking by eye."""
-    pid, base = find_process()
+    pid, base, dll = find_process()
     if pid is None:
         raise SystemExit(f"{EXE} is not running")
     if base is None:
         raise SystemExit(f"{D.DLL_NAME} not loaded in pid {pid}")
-    vptr = base + VPTR_RVA
+    # Print both, because "the resolver agrees with the pinned fallback" is the thing a
+    # maintainer wants to see after a game update -- if they differ, the vtable moved and
+    # the fallback is stale, which used to be a silent failure.
+    rva = vtable_rva(dll) if dll else None
+    if rva is None:
+        rva = VTABLE_RVA_FALLBACK
+        print(f"{SCENE_ROOT_SYMBOL}: not readable from the DLL; using the pinned "
+              f"0x{rva:x}")
+    else:
+        same = "same as the pinned fallback" if rva == VTABLE_RVA_FALLBACK else \
+            f"the pinned fallback 0x{VTABLE_RVA_FALLBACK:x} is STALE"
+        print(f"{SCENE_ROOT_SYMBOL}: RVA 0x{rva:x} read from the DLL ({same})")
+    vptr = base + rva + VPTR_SKIP
     print(f"pid {pid}  {D.DLL_NAME} @ 0x{base:x}  scene_root vptr 0x{vptr:x}")
+    # Which build this is. The struct offsets were read out of one particular DLL, so this
+    # is how you tell whether they belong to this one.
+    build = upload.dll_build(dll) if dll else None
+    if build is None:
+        print("game build unknown")
+    else:
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(build))
+        print(f"game build {build} ({when} UTC)")
 
     rd = ProcessReader(pid)
     t0 = time.time()
@@ -930,9 +1082,10 @@ def once():
           f"{len(roots)} scene_root candidate(s) "
           + " ".join(f"0x{r:x}" for r in roots))
     if not roots:
-        raise SystemExit("scene_root not found -- VTABLE_RVA is stale if the client "
-                         "updated, and a new logger release is needed "
-                         "(github.com/jimbursch1/navalgaming-logger)")
+        raise SystemExit("scene_root not found -- the anchor above came from this DLL, so "
+                         "suspect the DWARF struct offsets against a patched build, not "
+                         "the vtable (tools/gamefiles/dwarfstruct.py; README, 'When the "
+                         "client updates')")
 
     print("track:", json.dumps(read_track(rd, roots, vptr)))
     state, snap = read_battle(rd, roots, vptr)

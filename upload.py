@@ -55,6 +55,7 @@ import json
 import os
 import re
 import secrets
+import struct
 import sys
 import threading
 import time
@@ -65,7 +66,7 @@ import urllib.request
 # This logger's release. Sent in every health ping so the site can tell a member
 # their logger is behind; keep it equal to LOGGER_VERSION in inc/logger_version.php.
 # The date form compares correctly as a plain string, so nothing parses versions.
-VERSION = "2026-09-16b"
+VERSION = "2026-09-19b"
 CYCLE_S = 300               # between cycles, when no arrival wakes one sooner
 PING_S = 15                 # until the site first takes a ping, re-ping this often...
 PING_WINDOW_S = 1800        # ...for at most this long after starting
@@ -102,6 +103,42 @@ def check_url(url):
     if not u.hostname or not (u.scheme == "https" or
                               (u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost"))):
         raise ValueError("needs an https url")
+
+
+def dll_build(path):
+    """Which game build this is: the gameplay DLL's PE TimeDateStamp, or None.
+
+    The logger's DWARF struct offsets are read out of one file -- that DLL -- so its link
+    time is exactly the right thing to call "the build". (The vtable anchor is no longer
+    pinned: navalgaming_logger.vtable_rva reads it from whichever DLL is in front of it,
+    so what this build number still gates is the offsets.) Keying on the DLL rather
+    than on Steam's buildid means a content-only patch, which cannot break the logger,
+    raises no alarm; and because a TimeDateStamp is a unix time it still sorts, so the site
+    can tell "the game moved past us" from "this machine is behind".
+
+    Four seeks, no hashing: e_lfanew at 0x3C, then the COFF header's TimeDateStamp 8 bytes
+    into the PE signature. Opened without locking, so it reads fine while the game runs.
+
+    Returns None on anything unexpected -- a missing file, a non-PE, a zeroed stamp. The
+    site treats absent as "not saying", so being wrong here must never cost a battle.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0x3C)
+            head = f.read(4)
+            if len(head) != 4:
+                return None
+            pe = struct.unpack("<I", head)[0]
+            f.seek(pe)
+            rec = f.read(12)                     # signature, then Machine, nsec, stamp
+            if len(rec) != 12 or rec[:4] != b"PE\0\0":
+                return None
+            stamp = struct.unpack_from("<I", rec, 8)[0]
+            # 0 means a reproducible build that deliberately erased it; 2015 predates the
+            # game. Either way it is not a build identity, so say nothing.
+            return stamp if 1420070400 <= stamp <= 4102444800 else None
+    except (OSError, struct.error):
+        return None
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -235,6 +272,12 @@ class Uploader:
         self.state_name = "waiting"
         self.told = None                # the newest release already named in the log
         self.greeted = False            # whether the site has taken a ping this run
+        # The gameplay DLL, remembered across restarts. Steam patches while the game is
+        # shut, and the path is only learnable from a running process -- so without this,
+        # a build change would not be reported until the member next played. With it,
+        # a machine left on notices within one cycle.
+        self.game_dll = self.state.get("game_dll")
+        self.told_build = None          # the newest game build already named in the log
 
     def load_state(self):
         try:
@@ -242,8 +285,12 @@ class Uploader:
                 s = json.load(f)
         except (OSError, ValueError):
             s = {}
-        voyages = s.get("voyages") if isinstance(s, dict) else None
-        return {"voyages": voyages if isinstance(voyages, dict) else {}}
+        s = s if isinstance(s, dict) else {}
+        voyages = s.get("voyages")
+        dll = s.get("game_dll")
+        # A state file written before 2026-09-19 has no game_dll, which is simply unknown.
+        return {"voyages": voyages if isinstance(voyages, dict) else {},
+                "game_dll": dll if isinstance(dll, str) and dll else None}
 
     def save_state(self):
         tmp = self.state_path + ".tmp"
@@ -251,11 +298,25 @@ class Uploader:
             json.dump(self.state, f)
         os.replace(tmp, self.state_path)
 
+    def set_game(self, path):
+        """Remember the gameplay DLL, so the build is readable with the game closed."""
+        if path and path != self.game_dll:
+            self.game_dll = self.state["game_dll"] = path
+            self.save_state()
+
     def hello(self):
         """Tell the site the logger is alive, and what it is doing -- one small POST at
         the top of every cycle, so a member can see on their dossier whether it runs
-        (docs/plans/logger-health.md). The reply names the current release."""
-        reply = self.post({"kind": "hello", "version": VERSION, "state": self.state_name})
+        (docs/plans/logger-health.md). The reply names the current release, and the game
+        build the release's offsets were derived from
+        (docs/plans/game-build-detection.md)."""
+        ping = {"kind": "hello", "version": VERSION, "state": self.state_name}
+        # Omitted, not null, when unknown: a logger that has never seen the game run
+        # cannot say, and the site must not read that as a mismatch.
+        build = dll_build(self.game_dll) if self.game_dll else None
+        if build is not None:
+            ping["build"] = build
+        reply = self.post(ping)
         if not self.greeted:
             self.greeted = True
             self.log("upload: the site accepted this machine's token")
@@ -265,6 +326,16 @@ class Uploader:
             self.told = current
             self.log(f"upload: version {VERSION} -- version {current} is available. "
                      "Download the new release.")
+        # The same guard for the game build. A member who never opens their dossier still
+        # finds out here why their battles stopped -- and that it is not theirs to fix.
+        ours = (reply or {}).get("current_build")
+        if (build is not None and isinstance(ours, int) and build > ours
+                and build != self.told_build):
+            self.told_build = build
+            self.log(f"upload: the game has updated (build {build}); this release reads "
+                     f"build {ours}, and the offsets it uses to find the game are per "
+                     "build. A new logger release is needed -- "
+                     "github.com/jimbursch1/navalgaming-logger/releases/latest")
 
     def cycle(self):
         """Send the oldest voyage not yet sent, if it has reached port. Never raises."""
@@ -454,6 +525,10 @@ class Runner:
         """What the next health ping reports: attached, loading or waiting."""
         self.up.state_name = name
 
+    def set_game(self, path):
+        """Where the gameplay DLL is, so the ping can say which build this machine has."""
+        self.up.set_game(path)
+
     def nudge(self):
         """Run a cycle now instead of waiting out the rest of CYCLE_S."""
         self.wake.set()
@@ -482,9 +557,18 @@ def start(root, path=None, log=print):
 
 
 def main(argv):
-    if len(argv) != 2 or argv[0] not in ("--new-token", "--backfill"):
+    if len(argv) != 2 or argv[0] not in ("--new-token", "--backfill", "--build"):
         raise SystemExit("usage: py upload.py --new-token https://<site>/logger_upload.php\n"
-                         "       py upload.py --backfill <the logger's folder>")
+                         "       py upload.py --backfill <the logger's folder>\n"
+                         "       py upload.py --build <the gameplay DLL>")
+    if argv[0] == "--build":
+        # For the maintainer: this is the number that goes in LOGGER_GAME_BUILD
+        # (inc/logger_version.php) when a build is declared compatible.
+        b = dll_build(argv[1])
+        if b is None:
+            raise SystemExit(f"{argv[1]}: no usable PE TimeDateStamp")
+        print(f"{b}  ({time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(b))} UTC)")
+        return
     if argv[0] == "--backfill":
         try:
             up = Uploader(argv[1], load_config(config_path()))
