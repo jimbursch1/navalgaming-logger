@@ -66,7 +66,7 @@ import urllib.request
 # This logger's release. Sent in every health ping so the site can tell a member
 # their logger is behind; keep it equal to LOGGER_VERSION in inc/logger_version.php.
 # The date form compares correctly as a plain string, so nothing parses versions.
-VERSION = "2026-09-19b"
+VERSION = "2026-09-20"
 CYCLE_S = 300               # between cycles, when no arrival wakes one sooner
 PING_S = 15                 # until the site first takes a ping, re-ping this often...
 PING_WINDOW_S = 1800        # ...for at most this long after starting

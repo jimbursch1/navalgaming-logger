@@ -22,7 +22,7 @@ while the game runs.
 godot-cpp class, so each instance begins with a C++ vptr into the gameplay DLL.
 Find it once with an exact 8-byte search, then every read is a pointer chain:
 
-    scene_root +3056 bs -> battle_scene +256 o -> opaque +48 ships (std::map)
+    scene_root +3104 bs -> battle_scene +256 o -> opaque +48 ships (std::map)
                            battle_scene +40 my_ship_id
 
 The tree walk and ship parsing are `dumpbattle.py`'s, unchanged; the key == id
@@ -72,16 +72,21 @@ BATTLE_TICK_S = 1.0         # while a battle is loaded: a replay needs finer ste
 TORN_LIMIT = 9              # consecutive bad reads before a battle counts as over (~9 s)
 CHUNK = 1 << 26
 
-# The struct offsets below are from DWARF and are per build (2026-09-10 DLL, game build
-# 1789062088). The vtable RVA is NOT: vtable_rva() reads it out of the DLL in front of us,
+# The struct offsets below are from DWARF and are per build (2026-09-19 DLL, game build
+# 1789839329). The vtable RVA is NOT: vtable_rva() reads it out of the DLL in front of us,
 # because it moves with every client build and was the single commonest reason this logger
 # stopped working after a game update. This is the fallback for a DLL whose COFF symbol
-# table is missing or stripped -- correct for the 2026-09-10 build, and stale the moment
+# table is missing or stripped -- correct for the 2026-09-19 build, and stale the moment
 # the game patches, which is exactly why it is no longer the primary source.
+#
+# The 2026-09-19 build is the one that proved "it attached, so the offsets are fine" wrong:
+# scene_root, battle_scene and overworld_manager each grew 48 bytes, moving bs and player,
+# while the vtable resolved as usual and the logger reported itself attached. Nine of the
+# twelve structs were untouched -- see GAMEFILES.md 5.1 for the diff that settled it.
 SCENE_ROOT_SYMBOL = "_ZTV10scene_root"
-VTABLE_RVA_FALLBACK = 0x132D200
+VTABLE_RVA_FALLBACK = 0x1332120
 VPTR_SKIP = 16              # an instance's vptr skips offset-to-top and typeinfo
-SR_BS = 3056                # scene_root.bs : battle_scene*
+SR_BS = 3104                # scene_root.bs : battle_scene*
 BS_MY_SHIP = 40             # battle_scene.my_ship_id : uint64_t
 BS_OPAQUE = 256             # battle_scene.o : opaque*
 BS_BATTLE_POS = 8           # battle_scene.server_battle_pos : vec2f, overworld coordinates
@@ -99,7 +104,7 @@ LEAD_S = 7.0                # ...except a lone gun, which folds into a run start
 DAMAGE_S = 4.0              # hits land up to ~3 s after firing at 778 units
 
 # The overworld and the port, also DWARF (GAMEFILES.md 7.12).
-SR_PLAYER = 2232 + 136      # scene_root.overworld.player : overworld_ship
+SR_PLAYER = 2232 + 184      # scene_root.overworld.player : overworld_ship
 SR_PORT = 1152 + 336        # scene_root.port_manage.last_update : optional<server_port_update>
 PORT_ENGAGED, PORT_ID = 80, 8
 SHIP_POS, SHIP_DIR = 16, 64  # overworld_ship; both interpolated_value<vec2f>
